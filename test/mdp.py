@@ -4,10 +4,11 @@ import os
 import torch
 import numpy as np
 import gym
-from dreamerv2.utils.wrapper import GymMinAtar, OneHotAction
-from dreamerv2.training.config import MinAtarConfig
+from dreamerv2.utils.wrapper import UnityEnv, OneHotAction
+from dreamerv2.training.config import BokbunConfig
 from dreamerv2.training.trainer import Trainer
 from dreamerv2.training.evaluator import Evaluator
+
 
 def main(args):
     wandb.login()
@@ -16,7 +17,7 @@ def main(args):
 
     '''make dir for saving results'''
     result_dir = os.path.join('results', '{}_{}'.format(env_name, exp_id))
-    model_dir = os.path.join(result_dir, 'models')                                                  #dir to save learnt models
+    model_dir = os.path.join(result_dir, 'models')  # dir to save learnt models
     os.makedirs(model_dir, exist_ok=True)
 
     np.random.seed(args.seed)
@@ -26,92 +27,153 @@ def main(args):
         torch.cuda.manual_seed(args.seed)
     else:
         device = torch.device('cpu')
-    print('using :', device)  
-    
-    env = OneHotAction(GymMinAtar(env_name))
+    print('using :', device)
+
+    env = UnityEnv(env_name)
     obs_shape = env.observation_space.shape
+    print(f"obs shape: {env.observation_space.shape}")
     action_size = env.action_space.shape[0]
     obs_dtype = bool
     action_dtype = np.float32
     batch_size = args.batch_size
     seq_len = args.seq_len
 
-    config = MinAtarConfig(
+    config = BokbunConfig(
         env=env_name,
         obs_shape=obs_shape,
         action_size=action_size,
-        obs_dtype = obs_dtype,
-        action_dtype = action_dtype,
-        seq_len = seq_len,
-        batch_size = batch_size,
-        model_dir=model_dir, 
+        obs_dtype=obs_dtype,
+        action_dtype=action_dtype,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        model_dir=model_dir,
     )
+
+# 멀티모달 임베딩 얼리인먼트 샘플 데이터 전달 빨리
+# J1 - 영어 테스트 (이민 담당자와 인터뷰를 함)
+# J1 - Summarized로, 멀티모달 임베딩, XAI로
+# 에트리
+# 데이터는 많아서 리서치 수월
+#
 
     config_dict = config.__dict__
     trainer = Trainer(config, device)
     evaluator = Evaluator(config, device)
 
     with wandb.init(project='mastering MinAtar with world models', config=config_dict):
+        episode_number = 0
+        
         """training loop"""
         print('...training...')
         train_metrics = {}
         trainer.collect_seed_episodes(env)
         obs, score = env.reset(), 0
         done = False
+        print("before rssm state")
         prev_rssmstate = trainer.RSSM._init_rssm_state(1)
+        print("after rssm state")
         prev_action = torch.zeros(1, trainer.action_size).to(trainer.device)
         episode_actor_ent = []
         scores = []
         best_mean_score = 0
         best_save_path = os.path.join(model_dir, 'models_best.pth')
-        
-        for iter in range(1, trainer.config.train_steps):  
-            if iter%trainer.config.train_every == 0:
+        print("before loop")
+
+        for iter in range(1, trainer.config.train_steps):
+            print("iter: ", iter)
+            if iter % trainer.config.train_every == 0:
                 train_metrics = trainer.train_batch(train_metrics)
-            if iter%trainer.config.slow_target_update == 0:
-                trainer.update_target()                
-            if iter%trainer.config.save_every == 0:
+            if iter % trainer.config.slow_target_update == 0:
+                trainer.update_target()
+            if iter % trainer.config.save_every == 0:
                 trainer.save_model(iter)
             with torch.no_grad():
-                embed = trainer.ObsEncoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(trainer.device))  
-                _, posterior_rssm_state = trainer.RSSM.rssm_observe(embed, prev_action, not done, prev_rssmstate)
-                model_state = trainer.RSSM.get_model_state(posterior_rssm_state)
+                print("obs tyope: ", type(obs))
+                print("obs len: ", len(obs))
+                print("obs :", obs)
+                embed = trainer.ObsEncoder(torch.tensor(
+                    obs, dtype=torch.float32).unsqueeze(0).to(trainer.device))
+                _, posterior_rssm_state = trainer.RSSM.rssm_observe(
+                    embed, prev_action, not done, prev_rssmstate)
+                model_state = trainer.RSSM.get_model_state(
+                    posterior_rssm_state)
                 action, action_dist = trainer.ActionModel(model_state)
-                action = trainer.ActionModel.add_exploration(action, iter).detach()
+                action = trainer.ActionModel.add_exploration(
+                    action, iter).detach()
                 action_ent = torch.mean(action_dist.entropy()).item()
                 episode_actor_ent.append(action_ent)
 
-            next_obs, rew, done, _ = env.step(action.squeeze(0).cpu().numpy())
-            score += rew
+            next_obs, reward, done, _ = env.step(action.squeeze(0).cpu().numpy())
+            next_camera_obs, position, rotation, shake_x, shake_z = next_obs
+            print("rew, done: ", reward, done)
+            score += reward
+            
+            if 'episode_log_data' not in locals():
+                episode_log_data = []  # 에피소드 데이터 리스트 초기화
+
+            # 이미지 데이터를 wandb에 기록할 수 있도록 (H, W, C)로 변환
+            obs_img = next_camera_obs.transpose(1, 2, 0)  # (C, H, W) -> (H, W, C)로 변환
+
+            # 각 이터레이션의 데이터를 리스트에 추가
+            episode_log_data.append({
+                'iteration': iter,
+                'reward': reward,
+                'action_entropy': action_ent,
+                'position': position,
+                'rotation': rotation,
+                'shake_x': shake_x,
+                'shake_z': shake_z
+            })
 
             if done:
-                trainer.buffer.add(obs, action.squeeze(0).cpu().numpy(), rew, done)
+                episode_number += 1
+                print("==============================================")
+                trainer.buffer.add(obs, action.squeeze(
+                    0).cpu().numpy(), reward, done)
                 train_metrics['train_rewards'] = score
-                train_metrics['action_ent'] =  np.mean(episode_actor_ent)
-                wandb.log(train_metrics, step=iter)
+                train_metrics['action_ent'] = np.mean(episode_actor_ent)
+                
+                # 에피소드별로 데이터를 wandb에 한 번에 저장
+                wandb.log({
+                    'episode_data': episode_log_data,  # 에피소드 동안의 모든 로그 데이터
+                    'episode_score': score,
+                    'episode': episode_number,  # 에피소드 번호 추가
+                    **train_metrics  # 훈련 지표
+                }, step=episode_number)
+                
+                wandb.log({'observation_image': wandb.Image(obs_img)}, step=episode_number)
+                
+                # 에피소드가 끝났으니 로그 리스트를 초기화
+                episode_log_data = []  
+        
                 scores.append(score)
-                if len(scores)>100:
+                print('episode : ', len(scores), 'score : ', score)
+                if len(scores) > 1:
                     scores.pop(0)
                     current_average = np.mean(scores)
-                    if current_average>best_mean_score:
-                        best_mean_score = current_average 
-                        print('saving best model with mean score : ', best_mean_score)
+                    if current_average > best_mean_score:
+                        best_mean_score = current_average
+                        print('saving best model with mean score : ',
+                              best_mean_score)
                         save_dict = trainer.get_save_dict()
                         torch.save(save_dict, best_save_path)
-                
+
                 obs, score = env.reset(), 0
                 done = False
                 prev_rssmstate = trainer.RSSM._init_rssm_state(1)
-                prev_action = torch.zeros(1, trainer.action_size).to(trainer.device)
+                prev_action = torch.zeros(
+                    1, trainer.action_size).to(trainer.device)
                 episode_actor_ent = []
             else:
-                trainer.buffer.add(obs, action.squeeze(0).detach().cpu().numpy(), rew, done)
-                obs = next_obs
+                trainer.buffer.add(obs, action.squeeze(
+                    0).detach().cpu().numpy(), reward, done)
+                obs = next_camera_obs
                 prev_rssmstate = posterior_rssm_state
                 prev_action = action
 
     '''evaluating probably best model'''
     evaluator.eval_saved_agent(env, best_save_path)
+
 
 if __name__ == "__main__":
 
@@ -121,7 +183,9 @@ if __name__ == "__main__":
     parser.add_argument("--id", type=str, default='0', help='Experiment ID')
     parser.add_argument('--seed', type=int, default=123, help='Random seed')
     parser.add_argument('--device', default='cuda', help='CUDA or CPU')
-    parser.add_argument('--batch_size', type=int, default=50, help='Batch size')
-    parser.add_argument('--seq_len', type=int, default=50, help='Sequence Length (chunk length)')
+    parser.add_argument('--batch_size', type=int,
+                        default=50, help='Batch size')
+    parser.add_argument('--seq_len', type=int, default=50,
+                        help='Sequence Length (chunk length)')
     args = parser.parse_args()
     main(args)
